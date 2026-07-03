@@ -207,6 +207,75 @@ const r = await agent("hello");
         const body = extractScriptBody('const r = await agent("go");');
         assert.ok(body.includes("agent"));
     });
+
+    void it("strips non-meta ESM export/import keywords", async () => {
+        const { extractScriptBody } = await import("../features/workflow.ts");
+        const body = extractScriptBody(`
+export const meta = {
+  name: "t",
+  description: "t"
+}
+
+import { foo } from "bar";
+
+export default async function ({ agent }) {
+  return agent("go")
+}
+`);
+        // No export/import tokens survive into the vm.Script body.
+        assert.ok(!/\bexport\b/.test(body));
+        assert.ok(!/\bimport\b/.test(body));
+        // The default-exported function body is retained as a plain decl.
+        assert.ok(body.includes("async function"));
+        assert.ok(body.includes('agent("go")'));
+    });
+});
+
+// ─── extractAgentText / stripEscapes tests ─────────────────────────
+
+void describe("workflow extractAgentText", () => {
+    void it("extracts the final assistant message from agent_end", async () => {
+        const { extractAgentText } = await import("../features/workflow.ts");
+        const stream = [
+            '{"type":"session"}',
+            '{"type":"agent_start"}',
+            '{"type":"message_end","message":{"role":"user"}}',
+            '{"type":"agent_end","messages":[{"role":"user","content":[{"text":"hi"}]},{"role":"assistant","content":[{"text":"Hello world"}]}],"willRetry":false}',
+        ].join("\n");
+        assert.equal(extractAgentText(stream), "Hello world");
+    });
+
+    void it("falls back to concatenated text_delta events", async () => {
+        const { extractAgentText } = await import("../features/workflow.ts");
+        const stream = [
+            '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"foo "}}',
+            '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"bar"}}',
+        ].join("\n");
+        assert.equal(extractAgentText(stream), "foo bar");
+    });
+
+    void it("ignores OSC escape noise interleaved with JSON", async () => {
+        const { extractAgentText, stripEscapes } =
+            await import("../features/workflow.ts");
+        const esc = String.fromCharCode(27);
+        const bel = String.fromCharCode(7);
+        const stream =
+            esc +
+            "]777;notify;Pi;OK" +
+            bel +
+            '{"type":"agent_end","messages":[{"role":"assistant","content":[{"text":"OK"}]}]}';
+        assert.equal(
+            stripEscapes(stream),
+            '{"type":"agent_end","messages":[{"role":"assistant","content":[{"text":"OK"}]}]}'
+        );
+        assert.equal(extractAgentText(stream), "OK");
+    });
+
+    void it("returns empty string for unparseable output", async () => {
+        const { extractAgentText } = await import("../features/workflow.ts");
+        assert.equal(extractAgentText("not json at all"), "");
+        assert.equal(extractAgentText(""), "");
+    });
 });
 
 // ─── Registration tests ─────────────────────────────────────────────

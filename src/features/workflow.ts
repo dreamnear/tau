@@ -49,6 +49,7 @@ import type {
 import { Type } from "@earendil-works/pi-ai";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
+import { killProcessGroup } from "../utils.ts";
 import type {
     WorkflowMeta,
     WorkflowRun,
@@ -59,6 +60,14 @@ import type {
 
 const WORKFLOW_DIR = ".claude/workflows";
 const SESSION_WORKFLOW_DIR = "workflows";
+
+/** Per-run abort controllers, keyed by runId. Kept out of WorkflowRun so the
+ *  non-serialisable controller is never persisted in session entries. */
+const runAbortControllers = new Map<string, AbortController>();
+
+/** Default per-agent timeout. A single hung `pi -p` must not block the whole
+ *  workflow; this fails the agent loudly instead. */
+const AGENT_TIMEOUT_MS = 5 * 60 * 1000;
 
 // ─── Meta parser ────────────────────────────────────────────────────
 
@@ -154,16 +163,95 @@ export function getCachedResult(
 
 // ─── Agent execution ────────────────────────────────────────────────
 
+// Char 27 = ESC, char 7 = BEL. Built from char codes so no-control-regex
+// has nothing to flag.
+const ESC = String.fromCharCode(27);
+const BEL = String.fromCharCode(7);
+const OSC_RE = new RegExp(ESC + "][^" + BEL + "]*" + BEL, "g");
+const CSI_RE = new RegExp(ESC + "\\[" + "[\\d;]*[A-Za-z]", "g");
+
+/** Strip terminal escape sequences (OSC/CSI) that pi may emit inline. */
+export function stripEscapes(text: string): string {
+    return text.replace(OSC_RE, "").replace(CSI_RE, "");
+}
+
+type AgentMessage = {
+    role?: string;
+    content?: Array<{ text?: string }>;
+};
+type AgentEvent = {
+    type?: string;
+    messages?: AgentMessage[];
+    assistantMessageEvent?: { type?: string; delta?: string };
+};
+
+/** Type guard for a parsed `pi -p --mode json` event object. */
+function isAgentEvent(value: unknown): value is AgentEvent {
+    return typeof value === "object" && value !== null;
+}
+
+/**
+ * Extract the assistant's reply text from a `pi -p --mode json` event stream.
+ * Prefers the final assistant message on the `agent_end` event; falls back to
+ * concatenating `text_delta` events in order. Returns "" if nothing parseable
+ * is found.
+ */
+export function extractAgentText(jsonStream: string): string {
+    const cleaned = stripEscapes(jsonStream).trim();
+    if (!cleaned) return "";
+
+    let lastAssistant: string | undefined;
+    const deltas: string[] = [];
+
+    for (const rawLine of cleaned.split("\n")) {
+        const line = rawLine.trim();
+        if (!line.startsWith("{")) continue;
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(line);
+        } catch {
+            continue;
+        }
+        if (!isAgentEvent(parsed)) continue;
+        const evt = parsed;
+        if (evt.type === "agent_end" && Array.isArray(evt.messages)) {
+            for (let i = evt.messages.length - 1; i >= 0; i--) {
+                const msg = evt.messages[i];
+                if (msg.role === "assistant" && Array.isArray(msg.content)) {
+                    lastAssistant = msg.content
+                        .map((c) => c.text ?? "")
+                        .join("");
+                    break;
+                }
+            }
+        }
+        if (
+            evt.type === "message_update" &&
+            evt.assistantMessageEvent?.type === "text_delta" &&
+            typeof evt.assistantMessageEvent.delta === "string"
+        ) {
+            deltas.push(evt.assistantMessageEvent.delta);
+        }
+    }
+
+    return lastAssistant ?? deltas.join("");
+}
+
 /**
  * Spawn a `pi -p` subprocess to execute an agent call.
- * Returns the captured output text.
+ *
+ * Uses `--mode json` (not `--mode text`, which hangs on some pi builds) and
+ * parses the assistant reply out of the JSON event stream. Bounded by a
+ * per-agent timeout so a single stuck subprocess can never block the whole
+ * workflow; aborts and timeouts both SIGTERM the detached process group.
  */
 export async function executeAgent(
     prompt: string,
     opts: Record<string, unknown> | undefined,
     cwd: string,
     model?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    timeoutMs: number = AGENT_TIMEOUT_MS
 ): Promise<string> {
     const id = randomBytes(8).toString("hex");
     const promptFile = join(tmpdir(), `pi-wf-agent-${id}.md`);
@@ -172,21 +260,47 @@ export async function executeAgent(
     writeFileSync(promptFile, prompt);
 
     const modelArg = model ? ["--model", model] : [];
-    const spawnArgs = ["-p", "--mode", "text", ...modelArg, `@${promptFile}`];
+    const spawnArgs = ["-p", "--mode", "json", ...modelArg, `@${promptFile}`];
+
+    const cleanup = () => {
+        try {
+            unlinkSync(promptFile);
+        } catch {
+            /* already gone */
+        }
+        try {
+            unlinkSync(logFile);
+        } catch {
+            /* already gone */
+        }
+    };
 
     return new Promise((resolve, reject) => {
         const proc = spawn("pi", spawnArgs, {
             cwd,
             detached: true,
-            stdio: ["pipe", "pipe", "pipe"],
+            stdio: ["ignore", "pipe", "pipe"],
         });
 
         const logStream = createWriteStream(logFile, { flags: "w" });
         let output = "";
+        let settled = false;
+
+        const finish = (action: () => void) => {
+            if (settled) return;
+            settled = true;
+            logStream.end();
+            try {
+                if (proc.pid) killProcessGroup(proc.pid, "SIGTERM");
+            } catch {
+                /* already dead */
+            }
+            cleanup();
+            action();
+        };
 
         proc.stdout?.on("data", (chunk: Buffer) => {
-            const text = chunk.toString();
-            output += text;
+            output += chunk.toString();
             logStream.write(chunk);
         });
 
@@ -195,60 +309,52 @@ export async function executeAgent(
         });
 
         proc.on("close", (code) => {
-            logStream.end();
-            try {
-                unlinkSync(promptFile);
-            } catch {
-                /* already gone */
-            }
-            try {
-                unlinkSync(logFile);
-            } catch {
-                /* already gone */
-            }
-
             if (code === 0 || code === null) {
-                // Strip terminal escape sequences that pi may emit.
-                // Char 27 = ESC, char 7 = BEL. Built from char codes so
-                // no-control-regex has nothing to flag.
-                const esc = String.fromCharCode(27);
-                const bel = String.fromCharCode(7);
-                const oscRe = new RegExp(esc + "][^" + bel + "]*" + bel, "g");
-                const csiRe = new RegExp(esc + "\\[" + "[\\d;]*[A-Za-z]", "g");
-                const cleanOutput = output
-                    .replace(oscRe, "")
-                    .replace(csiRe, "")
-                    .trim();
-                resolve(cleanOutput);
+                const text = extractAgentText(output);
+                finish(() =>
+                    resolve(
+                        text.length > 0 ? text : stripEscapes(output).trim()
+                    )
+                );
             } else {
-                reject(
-                    new Error(
-                        `Agent exited with code ${code}: ${output.slice(0, 500)}`
+                finish(() =>
+                    reject(
+                        new Error(
+                            `Agent exited with code ${code}: ${output.slice(0, 500)}`
+                        )
                     )
                 );
             }
         });
 
         proc.on("error", (err) => {
-            logStream.end();
-            try {
-                unlinkSync(promptFile);
-            } catch {
-                /* already gone */
-            }
-            reject(err);
+            finish(() => reject(err));
         });
 
-        // Handle abort
+        // Per-agent timeout: SIGTERM the group and reject loudly.
+        const timer = setTimeout(() => {
+            finish(() =>
+                reject(
+                    new Error(
+                        `Agent timed out after ${Math.round(timeoutMs / 1000)}s`
+                    )
+                )
+            );
+        }, timeoutMs);
+        timer.unref();
+
+        // Abort (user `/workflow stop`): same kill path.
         if (signal) {
             const onAbort = () => {
-                proc.kill("SIGTERM");
-                reject(new Error("Agent aborted"));
+                finish(() => reject(new Error("Agent aborted")));
             };
             signal.addEventListener("abort", onAbort, { once: true });
             proc.on("close", () => {
                 signal.removeEventListener("abort", onAbort);
+                clearTimeout(timer);
             });
+        } else {
+            proc.on("close", () => clearTimeout(timer));
         }
     });
 }
@@ -265,10 +371,10 @@ export async function executeWorkflowScript(
     scriptBody: string,
     run: WorkflowRun,
     cwd: string,
+    abortController: AbortController,
     model?: string,
     onProgress?: (event: WorkflowProgressEvent) => void
 ): Promise<{ result: string; cachedResults: WorkflowAgentResult[] }> {
-    const abortController = new AbortController();
     const cachedResults = [...run.cachedResults];
     let agentCount = 0;
 
@@ -493,13 +599,29 @@ export type WorkflowProgressEvent =
 
 /**
  * Extract the script body (everything after the meta block).
- * Strips the `export const meta = ...` declaration.
+ * Strips the `export const meta = ...` declaration, then removes any
+ * remaining ESM `export` / `import` keywords so the body is valid in the
+ * CommonJS-style `vm.Script` context it runs in (where `export` is a hard
+ * syntax error). Spec-compliant scripts have no such keywords in the body;
+ * this is a robustness measure for non-compliant scripts and surfaces the
+ * real error instead of an opaque "Unexpected token 'export'".
  */
 export function extractScriptBody(script: string): string {
-    // Remove the meta export
-    return script
-        .replace(/export\s+const\s+meta\s*=\s*\{[\s\S]*?\n\}\s*\n?/, "")
-        .trim();
+    return (
+        script
+            // Drop the meta literal (parsed separately by parseMeta).
+            .replace(/export\s+const\s+meta\s*=\s*\{[\s\S]*?\n\}\s*\n?/, "")
+            // `export default <expr>` -> `<expr>`
+            .replace(/^\s*export\s+default\s+/gms, "")
+            // `export <decl>` -> `<decl>`
+            .replace(/^\s*export\s+/gms, "")
+            // `import ... from "...";` and bare `import "...";` (line-oriented)
+            .replace(
+                /^\s*import\s(?:[^;\n]*?\S)?\s*(?:from\s*["'][^"']*["'])?\s*;?\s*$/gms,
+                ""
+            )
+            .trim()
+    );
 }
 
 // ─── Workflow resolution ────────────────────────────────────────────
@@ -670,7 +792,13 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
                     ctx.ui.notify("No active workflow to stop.", "info");
                     return;
                 }
+                // Abort any in-flight agent subprocess immediately. This runs
+                // synchronously on the command thread; it does NOT await the
+                // hung run (which is what made stop unresponsive before).
+                const controller = runAbortControllers.get(run.runId);
+                if (controller) controller.abort();
                 run.status = "killed";
+                run.completedAt = Date.now();
                 pi.appendEntry("tau-workflow-state", run);
                 updateWorkflowStatus(state, ctx);
                 ctx.ui.notify(`Workflow "${run.name}" stopped.`, "warning");
@@ -913,6 +1041,11 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
         pi.appendEntry("tau-workflow-state", run);
         updateWorkflowStatus(state, ctx);
 
+        // Abort controller lives outside the run object so the non-serialisable
+        // controller is never persisted; `/workflow stop` looks it up by runId.
+        const abortController = new AbortController();
+        runAbortControllers.set(runId, abortController);
+
         const model = ctx.model;
         const modelId = model ? `${model.provider}/${model.id}` : undefined;
 
@@ -921,6 +1054,7 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
                 body,
                 run,
                 ctx.cwd,
+                abortController,
                 modelId,
                 () => {
                     // Refresh status bar on every progress event.
@@ -967,6 +1101,8 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
             updateWorkflowStatus(state, ctx);
 
             throw err;
+        } finally {
+            runAbortControllers.delete(runId);
         }
     }
 
