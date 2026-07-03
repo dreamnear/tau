@@ -1128,7 +1128,13 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
         }
         ctx.ui.notify(`Workflow "${metaName}" started.`, "info");
         void executeRun(pi, state, ctx, script, scriptPath, args)
-            .then((result) => ctx.ui.notify(result.summary, "info"))
+            .then((result) => {
+                // A killed run is already announced by `/workflow stop`; don't
+                // emit a redundant completion notify.
+                if (result.details?.status !== "killed") {
+                    ctx.ui.notify(result.summary, "info");
+                }
+            })
             .catch((err: unknown) =>
                 ctx.ui.notify(
                     `Workflow failed: ${err instanceof Error ? err.message : String(err)}`,
