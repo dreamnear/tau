@@ -278,6 +278,101 @@ void describe("workflow extractAgentText", () => {
     });
 });
 
+// ─── Claude Code script structure compatibility ────────────────────
+
+void describe("workflow getPiInvocation", () => {
+    void it("re-invokes the current on-disk entry script when present", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        const out = getPiInvocation(
+            ["-p", "--mode", "json"],
+            {
+                argv1: "/usr/local/bin/pi",
+                execPath: "/usr/local/bin/node",
+                platform: "darwin",
+            },
+            () => true // argv1 exists on disk
+        );
+        assert.equal(out.command, "/usr/local/bin/node");
+        assert.deepEqual(out.args, [
+            "/usr/local/bin/pi",
+            "-p",
+            "--mode",
+            "json",
+        ]);
+    });
+
+    void it("uses execPath directly for a non-generic runtime", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        // Bun-compiled pi binary: argv1 is the bun virtual fs, execPath is pi.
+        const out = getPiInvocation(
+            ["--no-session"],
+            {
+                argv1: "/$bunfs/root/lolcat.js",
+                execPath: "/Users/joe/.local/share/claude/versions/2.1.199",
+                platform: "darwin",
+            },
+            () => false
+        );
+        assert.equal(
+            out.command,
+            "/Users/joe/.local/share/claude/versions/2.1.199"
+        );
+        assert.deepEqual(out.args, ["--no-session"]);
+    });
+
+    void it("falls back to `pi` on PATH for a generic node/bun runtime", async () => {
+        const { getPiInvocation } = await import("../features/workflow.ts");
+        const out = getPiInvocation(
+            ["-p"],
+            {
+                argv1: undefined,
+                execPath: "/usr/local/bin/node",
+                platform: "linux",
+            },
+            () => false
+        );
+        assert.equal(out.command, "pi");
+        assert.deepEqual(out.args, ["-p"]);
+    });
+});
+
+// ─── Claude Code script structure compatibility ────────────────────
+
+void describe("workflow claude-script structure", () => {
+    void it("parses meta with phases[{title,kind}] and strips nothing else", async () => {
+        const { parseMeta, extractScriptBody } =
+            await import("../features/workflow.ts");
+        const script = [
+            "export const meta = {",
+            "  name: 'tf-backends',",
+            "  description: 'Add Terraform backends',",
+            "  phases: [",
+            "    { title: 'Design', kind: 'sequential' },",
+            "    { title: 'Implement', kind: 'sequential' },",
+            "  ],",
+            "}",
+            "",
+            "phase('Design')",
+            "const design = await agent('design it', { label: 'design', phase: 'Design' })",
+            "log('got design')",
+            "phase('Implement')",
+            "await agent(`implement: ${design}`, { label: 'impl', model: 'sonnet' })",
+        ].join("\n");
+        const meta = parseMeta(script);
+        assert.equal(meta.name, "tf-backends");
+        assert.equal(meta.phases?.[0].title, "Design");
+        assert.equal(meta.phases?.[0].kind, "sequential");
+
+        // The body retains the Claude-script top-level structure (no export
+        // tokens, phase()/log()/agent() calls intact) so it is VM-valid.
+        const body = extractScriptBody(script);
+        assert.ok(!/\bexport\b/.test(body));
+        assert.ok(body.includes("phase('Design')"));
+        assert.ok(body.includes("log('got design')"));
+        assert.ok(body.includes("model: 'sonnet'"));
+    });
+});
+
 // ─── Registration tests ─────────────────────────────────────────────
 
 void describe("workflow registration", () => {

@@ -31,6 +31,7 @@ import { createContext, Script } from "node:vm";
 import { createHash, randomBytes } from "node:crypto";
 import {
     createWriteStream,
+    existsSync,
     mkdirSync,
     readdirSync,
     readFileSync,
@@ -163,6 +164,38 @@ export function getCachedResult(
 
 // ─── Agent execution ────────────────────────────────────────────────
 
+/**
+ * Resolve how to re-invoke the currently-running pi for a sub-agent process.
+ * Ported from pi's official subagent example
+ * (packages/coding-agent/examples/extensions/subagent/index.ts): re-invoke the
+ * same entry point that is running us rather than relying on `pi` being on
+ * `$PATH`, so spawns work in worktrees, CI, and `pnpm exec` contexts. Exposed
+ * for unit testing; the `existsSync` check is injectable via `exists`.
+ */
+export function getPiInvocation(
+    args: string[],
+    fields: {
+        argv1: string | undefined;
+        execPath: string;
+        platform: string;
+    },
+    exists: (p: string) => boolean = existsSync
+): { command: string; args: string[] } {
+    const { argv1, execPath } = fields;
+    const isBunVirtualScript = argv1?.startsWith("/$bunfs/root/");
+    if (argv1 && !isBunVirtualScript && exists(argv1)) {
+        return { command: execPath, args: [argv1, ...args] };
+    }
+
+    const execName = (execPath.split("/").pop() ?? execPath).toLowerCase();
+    const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
+    if (!isGenericRuntime) {
+        return { command: execPath, args };
+    }
+
+    return { command: "pi", args };
+}
+
 // Char 27 = ESC, char 7 = BEL. Built from char codes so no-control-regex
 // has nothing to flag.
 const ESC = String.fromCharCode(27);
@@ -260,7 +293,16 @@ export async function executeAgent(
     writeFileSync(promptFile, prompt);
 
     const modelArg = model ? ["--model", model] : [];
-    const spawnArgs = ["-p", "--mode", "json", ...modelArg, `@${promptFile}`];
+    // `--no-session`: workflow agents are ephemeral; do not persist a throwaway
+    // session JSONL per agent() call. Matches pi's official subagent example.
+    const spawnArgs = [
+        "-p",
+        "--mode",
+        "json",
+        "--no-session",
+        ...modelArg,
+        `@${promptFile}`,
+    ];
 
     const cleanup = () => {
         try {
@@ -276,7 +318,12 @@ export async function executeAgent(
     };
 
     return new Promise((resolve, reject) => {
-        const proc = spawn("pi", spawnArgs, {
+        const invocation = getPiInvocation(spawnArgs, {
+            argv1: process.argv[1],
+            execPath: process.execPath,
+            platform: process.platform,
+        });
+        const proc = spawn(invocation.command, invocation.args, {
             cwd,
             detached: true,
             stdio: ["ignore", "pipe", "pipe"],
@@ -377,6 +424,9 @@ export async function executeWorkflowScript(
 ): Promise<{ result: string; cachedResults: WorkflowAgentResult[] }> {
     const cachedResults = [...run.cachedResults];
     let agentCount = 0;
+    // Tracks the script's global phase() so agent progress events can report
+    // which phase they belong to (Claude Code scripts call phase() at top level).
+    let currentPhase: string | undefined;
 
     // Create the agent() global function
     const agentFn = async (
@@ -384,6 +434,16 @@ export async function executeWorkflowScript(
         opts?: Record<string, unknown>
     ): Promise<string> => {
         const key = computeAgentKey(prompt, opts);
+        // Honour the agent() opts that Claude Code scripts rely on:
+        //   model  — per-agent model tier override (e.g. "sonnet"),
+        //            falling back to the run/session model.
+        //   label  — display label for progress events.
+        //   phase  — progress group for this agent; opts.phase overrides
+        //            the script's global phase() for this call.
+        const label = typeof opts?.label === "string" ? opts.label : undefined;
+        const phaseForEvent =
+            typeof opts?.phase === "string" ? opts.phase : currentPhase;
+        const agentModel = typeof opts?.model === "string" ? opts.model : model;
 
         // Check cache first
         const cached = cachedResults.find((r) => r.key === key);
@@ -393,6 +453,8 @@ export async function executeWorkflowScript(
                 agentIndex: agentCount,
                 key,
                 prompt: prompt.slice(0, 80),
+                label,
+                phase: phaseForEvent,
             });
             return cached.result;
         }
@@ -405,6 +467,8 @@ export async function executeWorkflowScript(
             agentIndex,
             key,
             prompt: prompt.slice(0, 80),
+            label,
+            phase: phaseForEvent,
         });
 
         try {
@@ -412,7 +476,7 @@ export async function executeWorkflowScript(
                 prompt,
                 opts,
                 cwd,
-                model,
+                agentModel,
                 abortController.signal
             );
 
@@ -432,6 +496,8 @@ export async function executeWorkflowScript(
                 key,
                 prompt: prompt.slice(0, 80),
                 resultLength: result.length,
+                label,
+                phase: phaseForEvent,
             });
 
             return result;
@@ -442,6 +508,8 @@ export async function executeWorkflowScript(
                 key,
                 prompt: prompt.slice(0, 80),
                 error: err instanceof Error ? err.message : String(err),
+                label,
+                phase: phaseForEvent,
             });
             throw err;
         }
@@ -477,6 +545,23 @@ export async function executeWorkflowScript(
         parallel: parallelFn,
         pipeline: pipelineFn,
         args: run.args,
+        // phase() and log() are optional-extension globals in the spec, but
+        // Claude Code scripts call them directly (no typeof-adapter), so the
+        // sandbox must provide them or the script throws ReferenceError.
+        phase: (title: string) => {
+            if (typeof title === "string") currentPhase = title;
+        },
+        log: (...args: unknown[]) => {
+            onProgress?.({
+                type: "log",
+                agentIndex: -1,
+                message: args
+                    .map((a) =>
+                        typeof a === "string" ? a : JSON.stringify(a, null, 2)
+                    )
+                    .join(" "),
+            });
+        },
         console: {
             log: (...args: unknown[]) => {
                 onProgress?.({
@@ -568,6 +653,8 @@ export type WorkflowProgressEvent =
           agentIndex: number;
           key: string;
           prompt: string;
+          label?: string;
+          phase?: string;
       }
     | {
           type: "agent_done";
@@ -575,6 +662,8 @@ export type WorkflowProgressEvent =
           key: string;
           prompt: string;
           resultLength: number;
+          label?: string;
+          phase?: string;
       }
     | {
           type: "agent_error";
@@ -582,12 +671,16 @@ export type WorkflowProgressEvent =
           key: string;
           prompt: string;
           error: string;
+          label?: string;
+          phase?: string;
       }
     | {
           type: "cache_hit";
           agentIndex: number;
           key: string;
           prompt: string;
+          label?: string;
+          phase?: string;
       }
     | {
           type: "log";
