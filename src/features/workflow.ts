@@ -1080,13 +1080,24 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
                 },
             };
         } catch (err) {
-            run.status = "failed";
-            run.completedAt = Date.now();
-            run.error = err instanceof Error ? err.message : String(err);
+            // If `/workflow stop` already marked this run killed, honour that
+            // instead of clobbering it with a failed/aborted error.
+            if (run.status !== "killed") {
+                run.status = "failed";
+                run.completedAt = Date.now();
+                run.error = err instanceof Error ? err.message : String(err);
+            }
 
             pi.appendEntry("tau-workflow-state", run);
             state.activeWorkflow = run;
             updateWorkflowStatus(state, ctx);
+
+            // A killed run is an expected stop, not an error to surface.
+            if (run.status === "killed")
+                return {
+                    summary: `Workflow "${meta.name}" stopped.`,
+                    details: { runId, name: meta.name, status: "killed" },
+                };
 
             throw err;
         } finally {
