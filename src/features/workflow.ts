@@ -811,25 +811,13 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
                 // Check for flags
                 if (rest.startsWith("--file ")) {
                     const filePath = rest.slice(7).trim();
-                    await runWorkflowFromFile(
-                        pi,
-                        state,
-                        ctx,
-                        filePath,
-                        undefined
-                    );
+                    runWorkflowFromFile(pi, state, ctx, filePath, undefined);
                     return;
                 }
 
                 if (rest.startsWith("--inline ")) {
                     const inlineScript = rest.slice(9).trim();
-                    await runWorkflowInline(
-                        pi,
-                        state,
-                        ctx,
-                        inlineScript,
-                        undefined
-                    );
+                    runWorkflowInline(pi, state, ctx, inlineScript, undefined);
                     return;
                 }
 
@@ -842,7 +830,7 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
                     );
                     return;
                 }
-                await runWorkflowByName(pi, state, ctx, name, undefined);
+                runWorkflowByName(pi, state, ctx, name, undefined);
                 return;
             }
 
@@ -1106,13 +1094,45 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
         }
     }
 
-    async function runWorkflowByName(
+    /**
+     * Launch a workflow in the background WITHOUT awaiting it, so the command
+     * thread stays free to process `/workflow stop` mid-run. Completion and
+     * failure are reported via notify from the detached promise. This mirrors
+     * how the `workflow` tool's own execute path differs: the tool awaits
+     * (the model wants the result), the slash command does not.
+     */
+    function launchWorkflowBackground(
+        pi: ExtensionAPI,
+        state: TauState,
+        ctx: ExtensionCommandContext,
+        script: string,
+        scriptPath: string | undefined,
+        args: unknown
+    ): void {
+        let metaName = "workflow";
+        try {
+            metaName = parseMeta(script).name;
+        } catch {
+            // parseMeta will throw again inside executeRun with a clear error.
+        }
+        ctx.ui.notify(`Workflow "${metaName}" started.`, "info");
+        void executeRun(pi, state, ctx, script, scriptPath, args)
+            .then((result) => ctx.ui.notify(result.summary, "info"))
+            .catch((err: unknown) =>
+                ctx.ui.notify(
+                    `Workflow failed: ${err instanceof Error ? err.message : String(err)}`,
+                    "error"
+                )
+            );
+    }
+
+    function runWorkflowByName(
         pi: ExtensionAPI,
         state: TauState,
         ctx: ExtensionCommandContext,
         name: string,
         args: unknown
-    ): Promise<void> {
+    ): void {
         const script = resolveWorkflow(name, ctx.cwd);
         if (!script) {
             ctx.ui.notify(
@@ -1121,73 +1141,34 @@ export function registerWorkflow(pi: ExtensionAPI, state: TauState): void {
             );
             return;
         }
-        try {
-            const result = await executeRun(
-                pi,
-                state,
-                ctx,
-                script,
-                undefined,
-                args
-            );
-            ctx.ui.notify(result.summary, "info");
-        } catch (err) {
-            ctx.ui.notify(
-                `Workflow failed: ${err instanceof Error ? err.message : String(err)}`,
-                "error"
-            );
-        }
+        launchWorkflowBackground(pi, state, ctx, script, undefined, args);
     }
 
-    async function runWorkflowFromFile(
+    function runWorkflowFromFile(
         pi: ExtensionAPI,
         state: TauState,
         ctx: ExtensionCommandContext,
         filePath: string,
         args: unknown
-    ): Promise<void> {
+    ): void {
+        let script: string;
         try {
-            const script = readFileSync(filePath, "utf8");
-            const result = await executeRun(
-                pi,
-                state,
-                ctx,
-                script,
-                filePath,
-                args
-            );
-            ctx.ui.notify(result.summary, "info");
-        } catch (err) {
-            ctx.ui.notify(
-                `Workflow failed: ${err instanceof Error ? err.message : String(err)}`,
-                "error"
-            );
+            script = readFileSync(filePath, "utf8");
+        } catch {
+            ctx.ui.notify(`Cannot read script file: ${filePath}`, "error");
+            return;
         }
+        launchWorkflowBackground(pi, state, ctx, script, filePath, args);
     }
 
-    async function runWorkflowInline(
+    function runWorkflowInline(
         pi: ExtensionAPI,
         state: TauState,
         ctx: ExtensionCommandContext,
         script: string,
         args: unknown
-    ): Promise<void> {
-        try {
-            const result = await executeRun(
-                pi,
-                state,
-                ctx,
-                script,
-                undefined,
-                args
-            );
-            ctx.ui.notify(result.summary, "info");
-        } catch (err) {
-            ctx.ui.notify(
-                `Workflow failed: ${err instanceof Error ? err.message : String(err)}`,
-                "error"
-            );
-        }
+    ): void {
+        launchWorkflowBackground(pi, state, ctx, script, undefined, args);
     }
 }
 
