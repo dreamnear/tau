@@ -25,11 +25,8 @@ import type {
     ExtensionAPI,
     SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import {
-    BorderedLoader,
-    convertToLlm,
-    serializeConversation,
-} from "@earendil-works/pi-coding-agent";
+import { serializeConversation } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, convertToLlm } from "./omp-compat.ts";
 import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";

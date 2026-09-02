@@ -8,10 +8,7 @@ import type {
     ExtensionAPI,
     ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
-import {
-    DynamicBorder,
-    getMarkdownTheme,
-} from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getMarkdownTheme } from "./omp-compat.ts";
 import { Container, Markdown, matchesKey, Text } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";

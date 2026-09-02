@@ -7,7 +7,7 @@ import type {
     ExtensionCommandContext,
     ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme } from "./omp-compat.ts";
 import {
     Container,
     type SettingItem,

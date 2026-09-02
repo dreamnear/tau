@@ -128,15 +128,9 @@ export function registerAgentSdkProvider(
         });
     };
 
-    pi.registerProvider(PROVIDER_ID, {
-        name: PROVIDER_DISPLAY_NAME,
-        api: PROVIDER_API,
-        // baseUrl is unused: streamSimple replaces the HTTP transport entirely.
-        // A literal placeholder satisfies the "apiKey required when defining
-        // models" rule; it is never sent — the SDK authenticates itself.
-        baseUrl: PROVIDER_ID,
-        apiKey: PROVIDER_ID,
-        models: buildProviderModels(),
-        streamSimple,
-    });
+    // omp: registering a provider whose api is the built-in
+    // "anthropic-messages" name is rejected here ("built-in API names are
+    // reserved") and aborts the whole tau extension load. This provider
+    // targets pi's Anthropic-OAuth setup, which omp does not need, so
+    // registration is skipped entirely.
 }

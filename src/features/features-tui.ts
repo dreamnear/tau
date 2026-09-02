@@ -8,10 +8,8 @@
  * `/tau features set <id> on|off --scope <scope>`.
  */
 
-import {
-    getSettingsListTheme,
-    type ExtensionCommandContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme } from "./omp-compat.ts";
 import {
     Container,
     SettingsList,

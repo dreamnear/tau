@@ -14,7 +14,7 @@ import type {
     ExtensionAPI,
     ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, getAgentDir } from "./omp-compat.ts";
 import {
     Container,
     Key,

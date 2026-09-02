@@ -25,12 +25,12 @@ import type {
     SlashCommandInfo,
     ToolInfo,
 } from "@earendil-works/pi-coding-agent";
+import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import {
     DEFAULT_COMPACTION_SETTINGS,
-    estimateTokens,
     getAgentDir,
     loadProjectContextFiles,
-} from "@earendil-works/pi-coding-agent";
+} from "./omp-compat.ts";
 import { Container, type Component, matchesKey } from "@earendil-works/pi-tui";
 import type { TauState } from "../state.ts";
 import { isFeatureEnabled } from "./features-helpers.ts";
@@ -966,7 +966,7 @@ export function registerContext(pi: ExtensionAPI, state: TauState): void {
             // Discover context files (AGENTS.md, CLAUDE.md, etc.)
             let contextFiles: Array<{ path: string; content: string }> = [];
             try {
-                contextFiles = loadProjectContextFiles({
+                contextFiles = await loadProjectContextFiles({
                     cwd: ctx.cwd,
                     agentDir: getAgentDir(),
                 });

@@ -4,7 +4,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { getSettingsListTheme } from "./omp-compat.ts";
 import {
     Container,
     type SettingItem,
